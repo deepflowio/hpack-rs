@@ -8,10 +8,12 @@ extern crate log;
 extern crate rustc_serialize;
 
 use std::collections::vec_deque;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fmt;
 use std::iter;
 use std::slice;
+use std::sync::Arc;
 
 // Re-export the main HPACK API entry points.
 pub use self::decoder::Decoder;
@@ -75,6 +77,8 @@ struct DynamicTable {
     table: VecDeque<(Vec<u8>, Vec<u8>)>,
     size: usize,
     max_size: usize,
+    // Headers there are not in the white list are not saved in the dynamic table. If the whitelist is empty, all headers are saved.
+    expected_headers: Arc<HashSet<Vec<u8>>>,
 }
 
 impl DynamicTable {
@@ -85,12 +89,23 @@ impl DynamicTable {
         DynamicTable::with_size(4096)
     }
 
+    /// Creates a new empty dynamic table with a headers white list.
+    fn new_with_expected_headers(expected_headers: Arc<HashSet<Vec<u8>>>) -> DynamicTable {
+        DynamicTable {
+            table: VecDeque::new(),
+            size: 0,
+            max_size: 4096,
+            expected_headers,
+        }
+    }
+
     /// Creates a new empty dynamic table with the given maximum size.
     fn with_size(max_size: usize) -> DynamicTable {
         DynamicTable {
             table: VecDeque::new(),
             size: 0,
             max_size: max_size,
+            expected_headers: Arc::new(HashSet::new()),
         }
     }
 
@@ -138,13 +153,25 @@ impl DynamicTable {
     /// case the total size of the given header exceeds the maximum size of the
     /// dynamic table.
     fn add_header(&mut self, name: Vec<u8>, value: Vec<u8>) {
-        // This is how the HPACK spec makes us calculate the size.  The 32 is
-        // a magic number determined by them (under reasonable assumptions of
-        // how the table is stored).
-        self.size += name.len() + value.len() + 32;
-        debug!("New dynamic table size {}", self.size);
-        // Now add it to the internal buffer
-        self.table.push_front((name, value));
+        let expected_header = if self.expected_headers.is_empty() {
+            true
+        } else {
+            self.expected_headers.contains(&name.to_ascii_lowercase())
+        };
+        if expected_header {
+            // This is how the HPACK spec makes us calculate the size.  The 32 is
+            // a magic number determined by them (under reasonable assumptions of
+            // how the table is stored).
+            self.size += name.len() + value.len() + 32;
+            debug!("New dynamic table size {}", self.size);
+            // Now add it to the internal buffer
+            self.table.push_front((name, value));
+        } else {
+            self.size += 32;
+            debug!("New dynamic table size {}", self.size);
+            // Add empty name and value to the internal buffer
+            self.table.push_front((vec![], vec![]));
+        }
         // ...and make sure we're not over the maximum size.
         self.consolidate_table();
         debug!("After consolidation dynamic table size {}", self.size);
@@ -262,8 +289,20 @@ impl<'a> HeaderTable<'a> {
     /// the given static table.
     pub fn with_static_table(static_table: StaticTable<'a>) -> HeaderTable<'a> {
         HeaderTable {
-            static_table: static_table,
+            static_table,
             dynamic_table: DynamicTable::new(),
+        }
+    }
+
+    /// Creates a new header table where the static part is initialized with
+    /// the given static table and expected headers.
+    pub fn with_expected_headers(
+        static_table: StaticTable<'a>,
+        expected_headers: Arc<HashSet<Vec<u8>>>,
+    ) -> HeaderTable<'a> {
+        HeaderTable {
+            static_table,
+            dynamic_table: DynamicTable::new_with_expected_headers(expected_headers),
         }
     }
 
@@ -320,11 +359,13 @@ impl<'a> HeaderTable<'a> {
             if dynamic_index < self.dynamic_table.len() {
                 match self.dynamic_table.get(dynamic_index) {
                     Some(&(ref name, ref value)) => Some((name, value)),
-                    None => None,
+                    None => Some((&[], &[])), // The message captured may be only part of the message, so the
+                                              // header may not be found, but there are still some header that
+                                              // can be obtained. If a None is returned, the parsing will fail.
                 }
             } else {
-                // Index out of bounds!
-                None
+                // Index out of bounds.
+                Some((&[], &[]))
             }
         }
     }
@@ -591,7 +632,11 @@ mod tests {
         let table = HeaderTable::with_static_table(STATIC_TABLE);
 
         assert!(table.get_from_table(0).is_none());
-        assert!(table.get_from_table(STATIC_TABLE.len() + 1).is_none());
+        assert!(table
+            .get_from_table(STATIC_TABLE.len() + 1)
+            .unwrap()
+            .0
+            .is_empty());
     }
 
     /// Tests that adding entries to the dynamic table through the

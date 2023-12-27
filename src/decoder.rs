@@ -46,7 +46,9 @@
 //! ```
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::num::Wrapping;
+use std::sync::Arc;
 
 use super::huffman::HuffmanDecoder;
 use super::huffman::HuffmanDecoderError;
@@ -255,6 +257,11 @@ impl<'a> Decoder<'a> {
         Decoder::with_static_table(STATIC_TABLE)
     }
 
+    /// Creates a new `Decoder` with all settings set to default values and expected headers.
+    pub fn new_with_expected_headers(expected_headers: Arc<HashSet<Vec<u8>>>) -> Decoder<'a> {
+        Decoder::with_expected_headers(STATIC_TABLE, expected_headers)
+    }
+
     /// Creates a new `Decoder` with the given slice serving as its static
     /// table.
     ///
@@ -267,6 +274,24 @@ impl<'a> Decoder<'a> {
     fn with_static_table(static_table: StaticTable<'a>) -> Decoder<'a> {
         Decoder {
             header_table: HeaderTable::with_static_table(static_table),
+        }
+    }
+
+    /// Creates a new `Decoder` with the given slice serving as its static
+    /// table and expected headers.
+    ///
+    /// The slice should contain tuples where the tuple coordinates represent
+    /// the header name and value, respectively.
+    ///
+    /// Note: in order for the final decoded content to match the encoding
+    ///       (according to the standard, at least), this static table must be
+    ///       the one defined in the HPACK spec.
+    fn with_expected_headers(
+        static_table: StaticTable<'a>,
+        expected_headers: Arc<HashSet<Vec<u8>>>,
+    ) -> Decoder<'a> {
+        Decoder {
+            header_table: HeaderTable::with_expected_headers(static_table, expected_headers),
         }
     }
 
@@ -308,7 +333,9 @@ impl<'a> Decoder<'a> {
             let consumed = match FieldRepresentation::new(initial_octet) {
                 FieldRepresentation::Indexed => {
                     let ((name, value), consumed) = self.decode_indexed(buffer_leftover)?;
-                    cb(Cow::Borrowed(name), Cow::Borrowed(value));
+                    if !name.is_empty() {
+                        cb(Cow::Borrowed(name), Cow::Borrowed(value));
+                    }
 
                     consumed
                 }
@@ -316,8 +343,9 @@ impl<'a> Decoder<'a> {
                     let ((name, value), consumed) = {
                         let ((name, value), consumed) =
                             self.decode_literal(buffer_leftover, true)?;
-                        cb(Cow::Borrowed(&name), Cow::Borrowed(&value));
-
+                        if !name.is_empty() {
+                            cb(Cow::Borrowed(&name), Cow::Borrowed(&value));
+                        }
                         // Since we are to add the decoded header to the header table, we need to
                         // convert them into owned buffers that the decoder can keep internally.
                         let name = name.into_owned();
@@ -336,7 +364,9 @@ impl<'a> Decoder<'a> {
                 }
                 FieldRepresentation::LiteralWithoutIndexing => {
                     let ((name, value), consumed) = self.decode_literal(buffer_leftover, false)?;
-                    cb(name, value);
+                    if !name.is_empty() {
+                        cb(name, value);
+                    }
 
                     consumed
                 }
@@ -346,13 +376,18 @@ impl<'a> Decoder<'a> {
                     // representation received here. We don't care about this
                     // for now.
                     let ((name, value), consumed) = self.decode_literal(buffer_leftover, false)?;
-                    cb(name, value);
+                    if !name.is_empty() {
+                        cb(name, value);
+                    }
 
                     consumed
                 }
                 FieldRepresentation::SizeUpdate => {
                     // Handle the dynamic table size update...
-                    self.update_max_dynamic_size(buffer_leftover)
+                    let (new_size, consumed) = decode_integer(buffer_leftover, 5)?;
+                    self.update_max_dynamic_size(new_size);
+
+                    consumed
                 }
             };
 
@@ -445,17 +480,13 @@ impl<'a> Decoder<'a> {
     /// octet in the `SizeUpdate` block.
     ///
     /// Returns the number of octets consumed from the given buffer.
-    fn update_max_dynamic_size(&mut self, buf: &[u8]) -> usize {
-        let (new_size, consumed) = decode_integer(buf, 5).ok().unwrap();
+    fn update_max_dynamic_size(&mut self, new_size: usize) {
         self.header_table.dynamic_table.set_max_table_size(new_size);
-
         info!(
             "Decoder changed max table size from {} to {}",
             self.header_table.dynamic_table.get_size(),
             new_size
         );
-
-        consumed
     }
 }
 
@@ -1325,14 +1356,6 @@ mod tests {
             // This indicates that the index of the header is 0, which is
             // invalid...
             vec![0x80],
-            // This indicates that the index of the header is 62, which is out
-            // of the bounds of the header table, given that there are no
-            // entries in the dynamic table and the static table contains 61
-            // elements.
-            vec![0xbe],
-            // Literal encoded with an indexed name where the index is out of
-            // bounds.
-            vec![126, 1, 65],
         ];
 
         // Check them all...
