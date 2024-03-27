@@ -50,7 +50,6 @@ use std::collections::HashSet;
 use std::num::Wrapping;
 use std::sync::Arc;
 
-use super::huffman::HuffmanDecoder;
 use super::huffman::HuffmanDecoderError;
 
 use super::STATIC_TABLE;
@@ -144,16 +143,18 @@ fn decode_string<'a>(buf: &'a [u8]) -> Result<(Cow<'a, [u8]>, usize), DecoderErr
         debug!("decode_string: Using the Huffman code");
         // Huffman coding used: pass the raw octets to the Huffman decoder
         // and return its result.
-        let mut decoder = HuffmanDecoder::new();
-        let decoded = match decoder.decode(raw_string) {
-            Err(e) => {
+        // The size of encoded http2 header is about 30% of the origin,
+        // so 2x buffer is allocated for decoding
+        let mut result = Vec::with_capacity(raw_string.len() << 1);
+        let speed = httlib_huffman::DecoderSpeed::FiveBits;
+        match httlib_huffman::decode(raw_string, &mut result, speed) {
+            Err(_) => {
                 return Err(DecoderError::StringDecodingError(
-                    StringDecodingError::HuffmanDecoderError(e),
+                    StringDecodingError::HuffmanDecoderError(HuffmanDecoderError::InvalidInput),
                 ));
             }
-            Ok(res) => res,
-        };
-        Ok((Cow::Owned(decoded), consumed + len))
+            Ok(_) => Ok((Cow::Owned(result), consumed + len)),
+        }
     } else {
         // The octets were transmitted raw
         debug!("decode_string: Raw octet string received");
