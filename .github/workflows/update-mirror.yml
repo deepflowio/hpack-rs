@@ -46,3 +46,4 @@ jobs:
           ssh-keyscan gitee.com >> ~/.ssh/known_hosts
           git remote add gitee  git@gitee.com:deepflowce/${{ env.REPO_NAME }}.git
           git push --no-verify --all gitee -u -f
+          git push -u gitee --tags -f
